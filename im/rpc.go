@@ -35,13 +35,32 @@ func SendGroupNotification(appid int64, gid int64,
 	msg := &Message{cmd: MSG_GROUP_NOTIFICATION, body: &GroupNotification{notification}}
 
 	for member := range(members) {
-		msgid, err := SaveMessage(appid, member, 0, msg)
+		msgid, _, err := SaveMessage(appid, member, 0, msg)
 		if err != nil {
 			break
 		}
 
 		//发送同步的通知消息
-		notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid}}
+		notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid}}
+		SendAppMessage(appid, member, notify)
+	}
+}
+
+func SendSuperGroupNotification(appid int64, gid int64, 
+	notification string, members IntSet) {
+
+	msg := &Message{cmd: MSG_GROUP_NOTIFICATION, body: &GroupNotification{notification}}
+
+	msgid, _, err := SaveGroupMessage(appid, gid, 0, msg)
+
+	if err != nil {
+		log.Errorf("save group message: %d err:%s", gid, err)
+		return
+	}
+	
+	for member := range(members) {
+		//发送同步的通知消息
+		notify := &Message{cmd:MSG_SYNC_GROUP_NOTIFY, body:&GroupSyncNotify{gid, msgid}}
 		SendAppMessage(appid, member, notify)
 	}
 }
@@ -49,52 +68,57 @@ func SendGroupNotification(appid int64, gid int64,
 
 func SendGroupIMMessage(im *IMMessage, appid int64) {
 	m := &Message{cmd:MSG_GROUP_IM, version:DEFAULT_VERSION, body:im}
-	group := group_manager.FindGroup(im.receiver)
+	deliver := GetGroupMessageDeliver(im.receiver)
+	group := deliver.LoadGroup(im.receiver)	
 	if group == nil {
 		log.Warning("can't find group:", im.receiver)
 		return
 	}
 	if group.super {
-		msgid, err := SaveGroupMessage(appid, im.receiver, 0, m)
+		msgid, _, err := SaveGroupMessage(appid, im.receiver, 0, m)
 		if err != nil {
 			return
 		}
 
 		//推送外部通知
-		PushGroupMessage(appid, im.receiver, m)
+		PushGroupMessage(appid, group, m)
 
 		//发送同步的通知消息
-		notify := &Message{cmd:MSG_SYNC_GROUP_NOTIFY, body:&GroupSyncKey{group_id:im.receiver, sync_key:msgid}}
-		SendAppGroupMessage(appid, im.receiver, notify)
+		notify := &Message{cmd:MSG_SYNC_GROUP_NOTIFY, body:&GroupSyncNotify{group_id:im.receiver, sync_key:msgid}}
+		SendAppGroupMessage(appid, group, notify)
 
 	} else {
+		gm := &PendingGroupMessage{}
+		gm.appid = appid
+		gm.sender = im.sender	
+		gm.device_ID = 0
+		gm.gid = im.receiver
+		gm.timestamp = im.timestamp
 		members := group.Members()
-		for member := range members {
-			msgid, err := SaveMessage(appid, member, 0, m)
-			if err != nil {
-				continue
-			}
-
-			//推送外部通知
-			PushMessage(appid, member, m)
-
-			//发送同步的通知消息
-			notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{sync_key:msgid}}
-			SendAppMessage(appid, member, notify)
+		gm.members = make([]int64, len(members))
+		i := 0
+		for uid := range members {
+			gm.members[i] = uid
+			i += 1
 		}
+		
+		gm.content = im.content
+		deliver := GetGroupMessageDeliver(group.gid)
+		m := &Message{cmd:MSG_PENDING_GROUP_MESSAGE, body: gm}
+		deliver.SaveMessage(m, nil)
 	}
 	atomic.AddInt64(&server_summary.in_message_count, 1)
 }
 
 func SendIMMessage(im *IMMessage, appid int64) {
 	m := &Message{cmd: MSG_IM, version:DEFAULT_VERSION, body: im}
-	msgid, err := SaveMessage(appid, im.receiver, 0, m)
+	msgid, _, err := SaveMessage(appid, im.receiver, 0, m)
 	if err != nil {
 		return
 	}
 
 	//保存到发送者自己的消息队列
-	msgid2, err := SaveMessage(appid, im.sender, 0, m)
+	msgid2, _, err := SaveMessage(appid, im.sender, 0, m)
 	if err != nil {
 		return
 	}
@@ -103,11 +127,11 @@ func SendIMMessage(im *IMMessage, appid int64) {
 	PushMessage(appid, im.receiver, m)
 
 	//发送同步的通知消息
-	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{sync_key:msgid}}
+	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid}}
 	SendAppMessage(appid, im.receiver, notify)
 
 	//发送同步的通知消息
-	notify = &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{sync_key:msgid2}}
+	notify = &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid2}}
 	SendAppMessage(appid, im.sender, notify)
 
 	atomic.AddInt64(&server_summary.in_message_count, 1)
@@ -116,7 +140,6 @@ func SendIMMessage(im *IMMessage, appid int64) {
 
 //http
 func PostGroupNotification(w http.ResponseWriter, req *http.Request) {
-	log.Info("post group notification")
 	body, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		WriteHttpError(400, err.Error(), w)
@@ -150,8 +173,17 @@ func PostGroupNotification(w http.ResponseWriter, req *http.Request) {
 		return		
 	}
 
-	members := NewIntSet()
+	is_super := false
+	if super_json, ok := obj.CheckGet("super"); ok {
+		is_super, err = super_json.Bool()
+		if err != nil {
+			log.Info("error:", err)
+			WriteHttpError(400, "invalid json format", w)
+			return		
+		}
+	}
 
+	members := NewIntSet()
 	marray, err := obj.Get("members").Array()
 	for _, m := range marray {
 		if _, ok := m.(json.Number); ok {
@@ -165,27 +197,31 @@ func PostGroupNotification(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	group := group_manager.FindGroup(group_id)
+	deliver := GetGroupMessageDeliver(group_id)
+	group := deliver.LoadGroup(group_id)
 	if group != nil {
 		ms := group.Members()
 		for m, _ := range ms {
 			members.Add(m)
 		}
+		is_super = group.super
 	}
 
 	if len(members) == 0 {
 		WriteHttpError(400, "group no member", w)
 		return
 	}
+	if (is_super) {
+		SendSuperGroupNotification(appid, group_id, notification, members)
+	} else {
+		SendGroupNotification(appid, group_id, notification, members)
+	}
 
-	SendGroupNotification(appid, group_id, notification, members)
-
-	log.Info("post group notification success:", members)
+	log.Info("post group notification success")
 	w.WriteHeader(200)
 }
 
-
-func PostIMMessage(w http.ResponseWriter, req *http.Request) {
+func PostPeerMessage(w http.ResponseWriter, req *http.Request) {
 	body, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		WriteHttpError(400, err.Error(), w)
@@ -197,54 +233,25 @@ func PostIMMessage(w http.ResponseWriter, req *http.Request) {
 	appid, err := strconv.ParseInt(m.Get("appid"), 10, 64)
 	if err != nil {
 		log.Info("error:", err)
-		WriteHttpError(400, "invalid json format", w)
+		WriteHttpError(400, "invalid param", w)
 		return
 	}
 
 	sender, err := strconv.ParseInt(m.Get("sender"), 10, 64)
 	if err != nil {
 		log.Info("error:", err)
-		WriteHttpError(400, "invalid json format", w)
+		WriteHttpError(400, "invalid param", w)
 		return
 	}
 
-	var is_group bool
-	msg_type := m.Get("class")
-	if msg_type == "group" {
-		is_group = true
-	} else if msg_type == "peer" {
-		is_group = false
-	} else {
-		log.Info("invalid message class")
-		WriteHttpError(400, "invalid message class", w)
+	receiver, err := strconv.ParseInt(m.Get("receiver"), 10, 64)
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid param", w)
 		return
 	}
 
-	obj, err := simplejson.NewJson(body)
-	if err != nil {
-		log.Info("error:", err)
-		WriteHttpError(400, "invalid json format", w)
-		return
-	}
-
-	sender2, err := obj.Get("sender").Int64()
-	if err == nil && sender == 0 {
-		sender = sender2
-	}
-
-	receiver, err := obj.Get("receiver").Int64()
-	if err != nil {
-		log.Info("error:", err)
-		WriteHttpError(400, "invalid json format", w)
-		return		
-	}
-	
-	content, err := obj.Get("content").String()
-	if err != nil {
-		log.Info("error:", err)
-		WriteHttpError(400, "invalid json format", w)
-		return		
-	}
+	content := string(body)
 
 	im := &IMMessage{}
 	im.sender = sender
@@ -253,14 +260,56 @@ func PostIMMessage(w http.ResponseWriter, req *http.Request) {
 	im.timestamp = int32(time.Now().Unix())
 	im.content = content
 
-	if is_group {
-		SendGroupIMMessage(im, appid)
-		log.Info("post group im message success")
- 	} else {
-		SendIMMessage(im, appid)
-		log.Info("post peer im message success")
-	}
+	SendIMMessage(im, appid)
+	
 	w.WriteHeader(200)
+	log.Info("post peer im message success")	
+}
+
+func PostGroupMessage(w http.ResponseWriter, req *http.Request) {
+	body, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		WriteHttpError(400, err.Error(), w)
+		return
+	}
+
+	m, _ := url.ParseQuery(req.URL.RawQuery)
+
+	appid, err := strconv.ParseInt(m.Get("appid"), 10, 64)
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid param", w)
+		return
+	}
+
+	sender, err := strconv.ParseInt(m.Get("sender"), 10, 64)
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid param", w)
+		return
+	}
+
+	receiver, err := strconv.ParseInt(m.Get("receiver"), 10, 64)
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid param", w)
+		return
+	}
+	
+	content := string(body)
+
+	im := &IMMessage{}
+	im.sender = sender
+	im.receiver = receiver
+	im.msgid = 0
+	im.timestamp = int32(time.Now().Unix())
+	im.content = content
+
+	SendGroupIMMessage(im, appid)
+	
+	w.WriteHeader(200)
+	
+	log.Info("post group im message success")	
 }
 
 func LoadLatestMessage(w http.ResponseWriter, req *http.Request) {
@@ -476,7 +525,10 @@ func GetOfflineCount(w http.ResponseWriter, req *http.Request){
 		return
 	}
 
-	last_id := GetSyncKey(appid, uid)
+	last_id, err := strconv.ParseInt(m.Get("sync_key"), 10, 64)
+	if err != nil || last_id == 0 {
+		last_id = GetSyncKey(appid, uid)		
+	}
 	sync_key := SyncHistory{AppID:appid, Uid:uid, LastMsgID:last_id}
 	
 	dc := GetStorageRPCClient(uid)
@@ -490,7 +542,7 @@ func GetOfflineCount(w http.ResponseWriter, req *http.Request){
 	}
 	count := resp.(int64)
 
-	log.Infof("get offline appid:%d uid:%d count:%d", appid, uid, count)
+	log.Infof("get offline appid:%d uid:%d sync_key:%d count:%d", appid, uid, last_id, count)
 	obj := make(map[string]interface{})
 	obj["count"] = count
 	WriteHttpObj(obj, w)
@@ -551,7 +603,7 @@ func SendSystemMessage(w http.ResponseWriter, req *http.Request) {
 	sys := &SystemMessage{string(body)}
 	msg := &Message{cmd:MSG_SYSTEM, body:sys}
 
-	msgid, err := SaveMessage(appid, uid, 0, msg)
+	msgid, _, err := SaveMessage(appid, uid, 0, msg)
 	if err != nil {
 		WriteHttpError(500, "internal server error", w)
 		return
@@ -561,7 +613,7 @@ func SendSystemMessage(w http.ResponseWriter, req *http.Request) {
 	PushMessage(appid, uid, msg)
 
 	//发送同步的通知消息
-	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid}}
+	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid}}
 	SendAppMessage(appid, uid, notify)
 	
 	w.WriteHeader(200)
@@ -602,11 +654,8 @@ func SendRoomMessage(w http.ResponseWriter, req *http.Request) {
 	room_im.content = string(body)
 
 	msg := &Message{cmd:MSG_ROOM_IM, body:room_im}
-	route := app_route.FindOrAddRoute(appid)
-	clients := route.FindRoomClientSet(room_id)
-	for c, _ := range(clients) {
-		c.wt <- msg
-	}
+
+	DispatchMessageToRoom(msg, room_id, appid, nil)
 
 	amsg := &AppMessage{appid:appid, receiver:room_id, msg:msg}
 	channel := GetRoomChannel(room_id)
@@ -677,14 +726,14 @@ func SendCustomerSupportMessage(w http.ResponseWriter, req *http.Request) {
 	m := &Message{cmd:MSG_CUSTOMER_SUPPORT, body:cm}
 
 
-	msgid, err := SaveMessage(cm.customer_appid, cm.customer_id, 0, m)
+	msgid, _, err := SaveMessage(cm.customer_appid, cm.customer_id, 0, m)
  	if err != nil {
 		log.Warning("save message error:", err)
 		WriteHttpError(500, "internal server error", w)
 		return
 	}
 	
-	msgid2, err := SaveMessage(config.kefu_appid, cm.seller_id, 0, m)
+	msgid2, _, err := SaveMessage(config.kefu_appid, cm.seller_id, 0, m)
  	if err != nil {
 		log.Warning("save message error:", err)
 		WriteHttpError(500, "internal server error", w)
@@ -694,11 +743,11 @@ func SendCustomerSupportMessage(w http.ResponseWriter, req *http.Request) {
 	PushMessage(cm.customer_appid, cm.customer_id, m)
 	
 	//发送给自己的其它登录点	
-	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid2}}
+	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid2}}
 	SendAppMessage(config.kefu_appid, cm.seller_id, notify)
 
 	//发送同步的通知消息
-	notify = &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid}}
+	notify = &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid}}
 	SendAppMessage(cm.customer_appid, cm.customer_id, notify)
 
 	w.WriteHeader(200)	
@@ -765,13 +814,13 @@ func SendCustomerMessage(w http.ResponseWriter, req *http.Request) {
 	m := &Message{cmd:MSG_CUSTOMER, body:cm}
 
 
-	msgid, err := SaveMessage(config.kefu_appid, cm.seller_id, 0, m)
+	msgid, _, err := SaveMessage(config.kefu_appid, cm.seller_id, 0, m)
  	if err != nil {
 		log.Warning("save message error:", err)
 		WriteHttpError(500, "internal server error", w)
 		return
 	}
-	msgid2, err := SaveMessage(cm.customer_appid, cm.customer_id, 0, m)
+	msgid2, _, err := SaveMessage(cm.customer_appid, cm.customer_id, 0, m)
  	if err != nil {
 		log.Warning("save message error:", err)
 		WriteHttpError(500, "internal server error", w)
@@ -782,12 +831,12 @@ func SendCustomerMessage(w http.ResponseWriter, req *http.Request) {
 	
 	
 	//发送同步的通知消息
-	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid}}
+	notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid}}
 	SendAppMessage(config.kefu_appid, cm.seller_id, notify)
 
 
 	//发送给自己的其它登录点
-	notify = &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid2}}
+	notify = &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncNotify{sync_key:msgid2}}
 	SendAppMessage(cm.customer_appid, cm.customer_id, notify)
 
 	resp := make(map[string]interface{})
@@ -835,12 +884,3 @@ func SendRealtimeMessage(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(200)
 }
 
-
-func InitMessageQueue(w http.ResponseWriter, req *http.Request) {
-	w.WriteHeader(200)
-}
-
-
-func DequeueMessage(w http.ResponseWriter, req *http.Request) {
-	w.WriteHeader(200)
-}

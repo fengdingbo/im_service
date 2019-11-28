@@ -42,12 +42,17 @@ type Config struct {
 	http_listen_address string
 	rpc_listen_address  string
 	
-	//engine io
+	//engine io listen address
+	//todo remove engine io
 	socket_io_address   string
-	
 	tls_address         string
+	
 	cert_file           string
 	key_file            string
+
+	//websocket listen address
+	ws_address          string
+	wss_address         string
 
 	storage_rpc_addrs   []string
 	group_storage_rpc_addrs   []string	
@@ -56,7 +61,8 @@ type Config struct {
 
 	group_deliver_count int //群组消息投递并发数量,默认4
 	word_file           string //关键词字典文件
-	sync_self           bool //是否同步自己发送的消息
+	friend_permission   bool //验证好友关系
+	enable_blacklist    bool //验证是否在对方的黑名单中
 }
 
 func get_int(app_cfg map[string]string, key string) int {
@@ -119,10 +125,15 @@ func read_cfg(cfg_path string) *Config {
 
 	config.pending_root = get_string(app_cfg, "pending_root")
 	config.mysqldb_datasource = get_string(app_cfg, "mysqldb_source")
-	config.socket_io_address = get_string(app_cfg, "socket_io_address")
+	config.socket_io_address = get_opt_string(app_cfg, "socket_io_address")
 	config.tls_address = get_opt_string(app_cfg, "tls_address")
+
+	config.ws_address = get_opt_string(app_cfg, "ws_address")
+	config.wss_address = get_opt_string(app_cfg, "wss_address")
+	
 	config.cert_file = get_opt_string(app_cfg, "cert_file")
 	config.key_file = get_opt_string(app_cfg, "key_file")
+
 	
 	config.kefu_appid = get_opt_int(app_cfg, "kefu_appid")
 
@@ -175,6 +186,7 @@ func read_cfg(cfg_path string) *Config {
 	}
 
 	config.word_file = get_opt_string(app_cfg, "word_file")
-	config.sync_self = get_opt_int(app_cfg, "sync_self") != 0
+	config.friend_permission = get_opt_int(app_cfg, "friend_permission") != 0
+	config.enable_blacklist = get_opt_int(app_cfg, "enable_blacklist") != 0
 	return config
 }

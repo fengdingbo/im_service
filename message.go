@@ -82,25 +82,44 @@ const MSG_GROUP_SYNC_KEY = 35
 //系统通知消息, unpersistent
 const MSG_NOTIFICATION = 36
 
+//消息的meta信息
+const MSG_METADATA = 37
+
+
 const MSG_VOIP_CONTROL = 64
 
 
 //消息标志
-//文本消息
+//文本消息 c <-> s
 const MESSAGE_FLAG_TEXT = 0x01
-//消息不持久化
+//消息不持久化 c <-> s
 const MESSAGE_FLAG_UNPERSISTENT = 0x02
 
-//群组离线消息 MSG_OFFLINE使用
+//群组消息 c -> s
 const MESSAGE_FLAG_GROUP = 0x04
 
-//离线消息由当前登录的用户在当前设备发出
+//离线消息由当前登录的用户在当前设备发出 c <- s
 const MESSAGE_FLAG_SELF = 0x08
 
-func init() {
-	message_creators[MSG_ACK] = func()IMessage{return new(MessageACK)}
-	message_creators[MSG_GROUP_NOTIFICATION] = func()IMessage{return new(GroupNotification)}
+//消息由服务器主动推到客户端 c <- s
+const MESSAGE_FLAG_PUSH = 0x10
 
+//超级群消息 c <- s
+const MESSAGE_FLAG_SUPER_GROUP = 0x20
+
+
+const ACK_SUCCESS = 0
+
+const ACK_NOT_MY_FRIEND = 1
+const ACK_NOT_YOUR_FRIEND = 2
+const ACK_IN_YOUR_BLACKLIST = 3
+
+const ACK_NOT_GROUP_MEMBER = 64
+
+//version1:IMMessage添加时间戳字段
+//version2:MessageACK添加status字段
+func init() {
+	message_creators[MSG_GROUP_NOTIFICATION] = func()IMessage{return new(GroupNotification)}
 	message_creators[MSG_AUTH_TOKEN] = func()IMessage{return new(AuthenticationToken)}
 
 	message_creators[MSG_RT] = func()IMessage{return new(RTMessage)}
@@ -114,28 +133,32 @@ func init() {
 	message_creators[MSG_CUSTOMER] = func()IMessage{return new(CustomerMessage)}
 	message_creators[MSG_CUSTOMER_SUPPORT] = func()IMessage{return new(CustomerMessage)}
 
-
 	message_creators[MSG_SYNC] = func()IMessage{return new(SyncKey)}
 	message_creators[MSG_SYNC_BEGIN] = func()IMessage{return new(SyncKey)}
 	message_creators[MSG_SYNC_END] = func()IMessage{return new(SyncKey)}
-	message_creators[MSG_SYNC_NOTIFY] = func()IMessage{return new(SyncKey)}
 	message_creators[MSG_SYNC_KEY] = func()IMessage{return new(SyncKey)}
 
 	message_creators[MSG_SYNC_GROUP] = func()IMessage{return new(GroupSyncKey)}
 	message_creators[MSG_SYNC_GROUP_BEGIN] = func()IMessage{return new(GroupSyncKey)}
 	message_creators[MSG_SYNC_GROUP_END] = func()IMessage{return new(GroupSyncKey)}
-	message_creators[MSG_SYNC_GROUP_NOTIFY] = func()IMessage{return new(GroupSyncKey)}
 	message_creators[MSG_GROUP_SYNC_KEY] = func()IMessage{return new(GroupSyncKey)}
 
+	message_creators[MSG_SYNC_NOTIFY] = func()IMessage{return new(SyncNotify)}
+	message_creators[MSG_SYNC_GROUP_NOTIFY] = func()IMessage{return new(GroupSyncNotify)}
+	
 	message_creators[MSG_NOTIFICATION] = func()IMessage{return new(SystemMessage)}
+	message_creators[MSG_METADATA] = func()IMessage{return new(Metadata)}
 	
 	message_creators[MSG_VOIP_CONTROL] = func()IMessage{return new(VOIPControl)}
 
+	message_creators[MSG_AUTH_STATUS] = func()IMessage{return new(AuthenticationStatus)}
+
+	
+	vmessage_creators[MSG_ACK] = func()IVersionMessage{return new(MessageACK)}	
 	vmessage_creators[MSG_GROUP_IM] = func()IVersionMessage{return new(IMMessage)}
 	vmessage_creators[MSG_IM] = func()IVersionMessage{return new(IMMessage)}
 
-	vmessage_creators[MSG_AUTH_STATUS] = func()IVersionMessage{return new(AuthenticationStatus)}
-
+	
 	message_descriptions[MSG_AUTH_STATUS] = "MSG_AUTH_STATUS"
 	message_descriptions[MSG_IM] = "MSG_IM"
 	message_descriptions[MSG_ACK] = "MSG_ACK"
@@ -165,6 +188,7 @@ func init() {
 	message_descriptions[MSG_SYNC_GROUP_NOTIFY] = "MSG_SYNC_GROUP_NOTIFY"
 
 	message_descriptions[MSG_NOTIFICATION] = "MSG_NOTIFICATION"
+	message_descriptions[MSG_METADATA] = "MSG_METADATA"	
 	message_descriptions[MSG_VOIP_CONTROL] = "MSG_VOIP_CONTROL"
 
 
@@ -186,6 +210,7 @@ func init() {
 	external_messages[MSG_SYNC_GROUP] = true;
 	external_messages[MSG_SYNC_KEY] = true;
 	external_messages[MSG_GROUP_SYNC_KEY] = true;
+	external_messages[MSG_METADATA] = true;
 }
 
 
@@ -216,6 +241,8 @@ type Message struct {
 	flag int
 	
 	body interface{}
+
+	meta *Metadata //non searialize
 }
 
 func (message *Message) ToData() []byte {
@@ -320,31 +347,21 @@ func (auth *AuthenticationToken) FromData(buff []byte) bool {
 
 type AuthenticationStatus struct {
 	status int32
-	ip int32 //兼容版本0
 }
 
-func (auth *AuthenticationStatus) ToData(version int) []byte {
+func (auth *AuthenticationStatus) ToData() []byte {
 	buffer := new(bytes.Buffer)
 	binary.Write(buffer, binary.BigEndian, auth.status)
-	if version == 0 {
-		binary.Write(buffer, binary.BigEndian, auth.ip)
-	}
 	buf := buffer.Bytes()
 	return buf
 }
 
-func (auth *AuthenticationStatus) FromData(version int, buff []byte) bool {
+func (auth *AuthenticationStatus) FromData(buff []byte) bool {
 	if len(buff) < 4 {
 		return false
 	}
 	buffer := bytes.NewBuffer(buff)
 	binary.Read(buffer, binary.BigEndian, &auth.status)
-	if version == 0 {
-		if len(buff) < 8 {
-			return false
-		}
-		binary.Read(buffer, binary.BigEndian, &auth.ip)
-	}
 	return true
 }
 
@@ -453,18 +470,25 @@ func (im *IMMessage) FromData(version int, buff []byte) bool {
 
 type MessageACK struct {
 	seq int32
+	status int8
 }
 
-func (ack *MessageACK) ToData() []byte {
+func (ack *MessageACK) ToData(version int) []byte {
 	buffer := new(bytes.Buffer)
 	binary.Write(buffer, binary.BigEndian, ack.seq)
+	if version > 1 {
+		binary.Write(buffer, binary.BigEndian, ack.status)
+	}
 	buf := buffer.Bytes()
 	return buf
 }
 
-func (ack *MessageACK) FromData(buff []byte) bool {
+func (ack *MessageACK) FromData(version int, buff []byte) bool {
 	buffer := bytes.NewBuffer(buff)
 	binary.Read(buffer, binary.BigEndian, &ack.seq)
+	if version > 1 {
+		binary.Read(buffer, binary.BigEndian, &ack.status)
+	}
 	return true
 }
 
@@ -710,6 +734,8 @@ func (id *SyncKey) FromData(buff []byte) bool {
 }
 
 
+type SyncNotify = SyncKey
+
 
 type GroupSyncKey struct {
 	group_id int64
@@ -736,4 +762,31 @@ func (id *GroupSyncKey) FromData(buff []byte) bool {
 	return true
 }
 
+type GroupSyncNotify = GroupSyncKey
 
+type Metadata struct {
+	sync_key int64
+	prev_sync_key int64
+}
+
+
+func (sync *Metadata) ToData() []byte {
+	buffer := new(bytes.Buffer)
+	binary.Write(buffer, binary.BigEndian, sync.sync_key)
+	binary.Write(buffer, binary.BigEndian, sync.prev_sync_key)
+	padding := [16]byte{}
+	buffer.Write(padding[:])
+	buf := buffer.Bytes()
+	return buf
+}
+
+func (sync *Metadata) FromData(buff []byte) bool {
+	if len(buff) < 32 {
+		return false
+	}
+
+	buffer := bytes.NewBuffer(buff)
+	binary.Read(buffer, binary.BigEndian, &sync.sync_key)
+	binary.Read(buffer, binary.BigEndian, &sync.prev_sync_key)
+	return true
+}
